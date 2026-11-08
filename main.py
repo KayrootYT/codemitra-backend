@@ -1,6 +1,7 @@
-import os
+import os, time
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from openai import OpenAI
 
@@ -11,85 +12,77 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"],
 client = OpenAI(
     base_url="https://integrate.api.nvidia.com/v1",
     api_key=os.environ["NVIDIA_API_KEY"],
-    timeout=40,
+    timeout=25,
+    max_retries=0,
 )
 
-MODEL = os.environ.get("MODEL", "deepseek-ai/deepseek-v4.1-flash")
-
 PREFERRED = [
-    MODEL,
     "deepseek-ai/deepseek-v4.1-flash",
-    "moonshotai/kimi-k2.6",
     "z-ai/glm-5.3-flash",
-    "minimaxai/minimax-m3.1-flash",
-    "nvidia/nemotron-3-super-120b-a12b",
     "nvidia/nemotron-3.5-lightning-30b-a3b",
-    "nvidia/nemotron-nano-3-30b-a3b",
     "google/gemma-4-31b-it",
     "openai/gpt-oss-20b",
-    "mistralai/mistral-large-4-1t-a52b",
-    "poolside/laguna-xs-2.1",
 ]
 
-working = {"model": None}
+state = {"model": None}
 
 
 class Req(BaseModel):
     message: str
     lang: str = "hi"
+    history: list = []
 
 
-def live_models():
-    try:
-        return [m.id for m in client.models.list().data]
-    except Exception:
-        return []
+def build(r: Req):
+    lang = ("Hindi (Roman or Devanagari, match the user)"
+            if r.lang == "hi" else "English")
+    msgs = [{"role": "system",
+             "content": "You are CodeMitra, an expert coding assistant. "
+                        f"Reply in {lang}. Be concise and practical. "
+                        "Put code in markdown code blocks."}]
+    for h in r.history[-6:]:
+        if h.get("role") in ("user", "assistant") and h.get("content"):
+            msgs.append({"role": h["role"], "content": h["content"]})
+    msgs.append({"role": "user", "content": r.message})
+    return msgs
 
 
-def candidates():
-    live = live_models()
-    out = []
-    if working["model"]:
-        out.append(working["model"])
-    for m in PREFERRED:
-        if m not in out and (not live or m in live):
-            out.append(m)
-    return out or PREFERRED
+def order():
+    out = [state["model"]] if state["model"] else []
+    return out + [m for m in PREFERRED if m not in out]
 
 
 @app.get("/")
 def home():
-    return {"status": "ok", "model": working["model"] or MODEL}
+    return {"status": "ok", "model": state["model"]}
 
 
-@app.get("/models")
-def models():
-    ids = live_models()
-    return ids[:300] if ids else {"error": "could not fetch models"}
+@app.post("/chat/stream")
+def chat_stream(r: Req):
+    msgs = build(r)
 
+    def gen():
+        errors = []
+        for m in order():
+            try:
+                stream = client.chat.completions.create(
+                    model=m, messages=msgs, max_tokens=1200, stream=True)
+                got = False
+                for ch in stream:
+                    if not ch.choices:
+                        continue
+                    t = ch.choices[0].delta.content
+                    if t:
+                        got = True
+                        yield t
+                if got:
+                    state["model"] = m
+                    return
+                errors.append(f"{m}: empty")
+            except Exception as e:
+                if state["model"] == m:
+                    state["model"] = None
+                errors.append(f"{m}: {str(e)[:60]}")
+        yield "Sab models fail hue:\n" + "\n".join(errors)
 
-@app.post("/chat")
-def chat(r: Req):
-    lang = ("Hindi (Roman or Devanagari, match the user)"
-            if r.lang == "hi" else "English")
-    msgs = [
-        {"role": "system",
-         "content": f"You are CodeMitra, an expert coding assistant. "
-                    f"Reply in {lang}. Keep code in markdown code blocks."},
-        {"role": "user", "content": r.message},
-    ]
-    errors = []
-    for m in candidates():
-        try:
-            resp = client.chat.completions.create(
-                model=m, messages=msgs, max_tokens=1000)
-            text = resp.choices[0].message.content
-            if not text:
-                raise ValueError("empty reply")
-            working["model"] = m
-            return {"reply": text}
-        except Exception as e:
-            if working["model"] == m:
-                working["model"] = None
-            errors.append(f"{m}: {str(e)[:70]}")
-    return {"reply": "Sab models fail hue:\n" + "\n".join(errors)}
+    return StreamingResponse(gen(), media_type="text/plain; charset=utf-8")

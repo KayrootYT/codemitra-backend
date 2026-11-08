@@ -143,6 +143,15 @@ async def read_attachments(uploads: list[UploadFile]):
                 texts.append("--- PDF: " + name + " ---\n" + "\n".join((p.extract_text() or "") for p in reader.pages[:30])[:30000])
             except Exception:
                 texts.append("[PDF text extraction unavailable for " + name + "]")
+        elif ext == ".docx":
+            try:
+                from xml.etree import ElementTree
+                with zipfile.ZipFile(io.BytesIO(data)) as archive:
+                    root = ElementTree.fromstring(archive.read("word/document.xml"))
+                content = " ".join(node.text or "" for node in root.iter() if node.tag.endswith("}t"))
+                texts.append("--- DOCX: " + name + " ---\n" + content[:30000])
+            except Exception:
+                texts.append("[DOCX text extraction unavailable for " + name + "]")
         elif ext in TEXT_EXTENSIONS or ctype.startswith("text/"):
             texts.append("--- FILE: " + name + " ---\n" + data.decode("utf-8", errors="replace")[:20000])
         else:

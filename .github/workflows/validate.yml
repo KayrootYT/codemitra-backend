@@ -1,0 +1,16 @@
+name: Validate CodeMitra backend
+on:
+  pull_request:
+  push:
+    branches: [main]
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install -r requirements.txt
+      - run: python -m py_compile main.py
+      - run: python -c "import main; assert any(r.path == '/chat/stream' for r in main.app.routes); assert any(r.path == '/project/zip' for r in main.app.routes); print('CodeMitra API routes loaded')"

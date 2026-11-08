@@ -12,7 +12,7 @@ client = OpenAI(
     base_url="https://integrate.api.nvidia.com/v1",
     api_key=os.environ["NVIDIA_API_KEY"],
 )
-MODEL = os.environ.get("MODEL", "qwen/qwen2.5-coder-32b-instruct")
+MODEL = os.environ.get("MODEL", "qwen/qwen3-coder-480b-a35b-instruct")
 
 class Req(BaseModel):
     message: str
@@ -20,17 +20,27 @@ class Req(BaseModel):
 
 @app.get("/")
 def home():
-    return {"status": "ok"}
+    return {"status": "ok", "model": MODEL}
+
+@app.get("/models")
+def models():
+    try:
+        return [m.id for m in client.models.list().data][:200]
+    except Exception as e:
+        return {"error": str(e)}
 
 @app.post("/chat")
 def chat(r: Req):
     lang = "Hindi (Roman or Devanagari, match the user)" if r.lang == "hi" else "English"
-    resp = client.chat.completions.create(
-        model=MODEL,
-        messages=[
-            {"role": "system", "content": f"You are CodeMitra, an expert coding assistant. Reply in {lang}. Keep code in markdown code blocks."},
-            {"role": "user", "content": r.message},
-        ],
-        max_tokens=1000,
-    )
-    return {"reply": resp.choices[0].message.content}
+    try:
+        resp = client.chat.completions.create(
+            model=MODEL,
+            messages=[
+                {"role": "system", "content": f"You are CodeMitra, an expert coding assistant. Reply in {lang}. Keep code in markdown code blocks."},
+                {"role": "user", "content": r.message},
+            ],
+            max_tokens=1000,
+        )
+        return {"reply": resp.choices[0].message.content}
+    except Exception as e:
+        return {"reply": f"Error (model: {MODEL}): {e}"}

@@ -1,4 +1,7 @@
 import os
+import io
+import zipfile
+from pathlib import PurePosixPath
 from threading import Lock
 from typing import Literal
 
@@ -237,3 +240,32 @@ def chat_stream(request: ChatRequest):
         media_type="text/plain; charset=utf-8",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+class ProjectFile(BaseModel):
+    path: str = Field(min_length=1, max_length=240)
+    content: str = Field(max_length=2000000)
+
+
+class ProjectZipRequest(BaseModel):
+    project_name: str = Field(default="CodeMitra-Project", min_length=1, max_length=80)
+    files: list[ProjectFile] = Field(min_length=1, max_length=100)
+
+
+@app.post("/project/zip")
+def create_project_zip(request: ProjectZipRequest):
+    buffer = io.BytesIO()
+    seen = set()
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for item in request.files:
+            normalized = item.path.replace("\\\\", "/").strip().lstrip("/")
+            parts = PurePosixPath(normalized).parts
+            if not normalized or any(part in {"..", "."} for part in parts) or ":" in normalized:
+                raise HTTPException(status_code=400, detail="Unsafe project file path.")
+            path = "/".join(parts)
+            if path in seen:
+                raise HTTPException(status_code=400, detail="Duplicate project file path.")
+            seen.add(path)
+            archive.writestr(path, item.content)
+    name = "".join(c for c in request.project_name if c.isalnum() or c in "-_ ")[:60].strip() or "CodeMitra-Project"
+    return Response(content=buffer.getvalue(), media_type="application/zip", headers={"Content-Disposition": "attachment; filename=\"" + name + ".zip\"", "Cache-Control": "no-store"})

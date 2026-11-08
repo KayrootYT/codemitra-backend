@@ -259,11 +259,13 @@ def health_check():
 
 @app.get("/voice/config")
 def voice_config():
+    has_elevenlabs = bool(os.getenv("ELEVENLABS_API_KEY"))
+    piper_enabled = os.getenv("TTS_PROVIDER", "piper").lower() in {"piper", "auto"}
     return {
-        "provider": "elevenlabs" if os.getenv("ELEVENLABS_API_KEY") else "browser",
-        "male_available": bool(os.getenv("VOICE_MALE_ID")),
-        "female_available": bool(os.getenv("VOICE_FEMALE_ID")),
-        "clone_available": bool(os.getenv("ELEVENLABS_API_KEY")),
+        "provider": "elevenlabs" if has_elevenlabs else "piper" if piper_enabled else "browser",
+        "male_available": (has_elevenlabs and bool(os.getenv("VOICE_MALE_ID"))) or piper_enabled,
+        "female_available": (has_elevenlabs and bool(os.getenv("VOICE_FEMALE_ID"))) or piper_enabled,
+        "clone_available": has_elevenlabs,
         "styles": ["friendly", "calm", "energetic", "professional"],
     }
 
@@ -271,7 +273,16 @@ def voice_config():
 @app.post("/voice/speak")
 async def voice_speak(request: SpeechRequest, http_request: Request):
     enforce_rate_limit(http_request, "voice_speak", 30, 60)
-    key = eleven_key()
+    key = os.getenv("ELEVENLABS_API_KEY")
+    provider = os.getenv("TTS_PROVIDER", "piper").lower()
+    if not key and request.lang == "hi" and provider in {"piper", "auto"}:
+        try:
+            audio = await asyncio.to_thread(synthesize_piper, request.text, request.gender)
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"Open-source Hindi TTS failed: {str(exc)[:220]}")
+        return Response(content=audio, media_type="audio/wav", headers={"Cache-Control": "no-store"})
+    if not key:
+        raise HTTPException(status_code=503, detail="Set ELEVENLABS_API_KEY or enable TTS_PROVIDER=piper for Hindi voice.")
     voice_id = request.voice_id or (
         os.getenv("VOICE_MALE_ID") if request.gender == "male" else os.getenv("VOICE_FEMALE_ID")
     )

@@ -132,21 +132,18 @@ async def voice_speak(request: SpeechRequest):
     )
     if not voice_id:
         raise HTTPException(status_code=503, detail="Set VOICE_MALE_ID or VOICE_FEMALE_ID in backend environment.")
-    style_prompts = {
-        "friendly": "Speak warmly and naturally, like a helpful friend.",
-        "calm": "Speak calmly, gently, and at a relaxed pace.",
-        "energetic": "Speak with positive energy and lively but natural emphasis.",
-        "professional": "Speak clearly and confidently in a polished professional tone.",
-    }
     payload = {
         "text": request.text,
         "model_id": "eleven_v4_turbo",
         "language_code": "hi" if request.lang == "hi" else "en",
         "apply_text_normalization": "auto",
-        "voice_settings": {"stability": 0.48, "similarity_boost": 0.78, "style": 0.35, "use_speaker_boost": True},
+        "voice_settings": {
+            "stability": 0.58 if request.style == "professional" else 0.42 if request.style == "energetic" else 0.52,
+            "similarity_boost": 0.78,
+            "style": 0.15 if request.style == "professional" else 0.55 if request.style == "energetic" else 0.35,
+            "use_speaker_boost": True,
+        },
     }
-    # Delivery direction is prepended as a non-spoken model instruction.
-    payload["text"] = f"[{style_prompts[request.style]}] {request.text}"
     async with httpx.AsyncClient(timeout=60) as client:
         try:
             result = await client.post(

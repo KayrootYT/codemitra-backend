@@ -1,4 +1,6 @@
 import os
+import json
+import base64
 import io
 import zipfile
 from pathlib import PurePosixPath
@@ -72,7 +74,7 @@ def get_client() -> OpenAI:
     )
 
 
-def build_messages(request: ChatRequest) -> list[dict]:
+def build_messages(request: ChatRequest, attachment_text=None, image_parts=None) -> list[dict]:
     language = (
         "Hindi (use Roman or Devanagari script to match the user)"
         if request.lang == "hi"
@@ -89,8 +91,63 @@ def build_messages(request: ChatRequest) -> list[dict]:
     }]
     for item in request.history[-10:]:
         messages.append({"role": item.role, "content": item.content})
-    messages.append({"role": "user", "content": request.message})
+    user_text = request.message
+    if attachment_text:
+        user_text += "\n\nATTACHED FILE CONTENTS:\n" + "\n\n".join(attachment_text)
+    if image_parts:
+        messages.append({"role": "user", "content": [{"type": "text", "text": user_text}] + image_parts})
+    else:
+        messages.append({"role": "user", "content": user_text})
     return messages
+
+
+
+
+TEXT_EXTENSIONS = {".txt", ".md", ".py", ".js", ".jsx", ".ts", ".tsx", ".html", ".css", ".json", ".xml", ".yaml", ".yml", ".toml", ".ini", ".kt", ".java", ".gradle", ".properties", ".sql", ".sh", ".csv", ".log", ".dart", ".swift", ".c", ".cpp", ".h", ".go", ".rs", ".php", ".rb", ".vue", ".svelte"}
+
+async def read_attachments(uploads: list[UploadFile]):
+    texts, images, total = [], [], 0
+    for upload in uploads[:10]:
+        data = await upload.read(15 * 1024 * 1024 + 1)
+        total += len(data)
+        if len(data) > 15 * 1024 * 1024 or total > 30 * 1024 * 1024:
+            raise HTTPException(status_code=413, detail="Attachments exceed 30 MB total.")
+        name = (upload.filename or "attachment").replace("\\\\", "/").split("/")[-1][:160]
+        ctype = upload.content_type or "application/octet-stream"
+        ext = PurePosixPath(name).suffix.lower()
+        if ctype in {"image/jpeg", "image/png", "image/webp"}:
+            encoded = base64.b64encode(data).decode("ascii")
+            images.append({"type": "image_url", "image_url": {"url": "data:" + ctype + ";base64," + encoded}})
+            texts.append("[Image attached: " + name + "]")
+        elif ext == ".zip" or ctype in {"application/zip", "application/x-zip-compressed"}:
+            try:
+                with zipfile.ZipFile(io.BytesIO(data)) as archive:
+                    expanded = 0
+                    for info in archive.infolist()[:80]:
+                        if info.is_dir() or info.file_size > 1000000:
+                            continue
+                        path = info.filename.replace("\\\\", "/")
+                        if ".." in PurePosixPath(path).parts:
+                            continue
+                        expanded += info.file_size
+                        if expanded > 8000000:
+                            break
+                        if PurePosixPath(path).suffix.lower() in TEXT_EXTENSIONS:
+                            texts.append("--- ZIP FILE: " + path + " ---\n" + archive.read(info).decode("utf-8", errors="replace")[:12000])
+            except zipfile.BadZipFile:
+                raise HTTPException(status_code=400, detail="Invalid ZIP archive.")
+        elif ext == ".pdf" or ctype == "application/pdf":
+            try:
+                from pypdf import PdfReader
+                reader = PdfReader(io.BytesIO(data))
+                texts.append("--- PDF: " + name + " ---\n" + "\n".join((p.extract_text() or "") for p in reader.pages[:30])[:30000])
+            except Exception:
+                texts.append("[PDF text extraction unavailable for " + name + "]")
+        elif ext in TEXT_EXTENSIONS or ctype.startswith("text/"):
+            texts.append("--- FILE: " + name + " ---\n" + data.decode("utf-8", errors="replace")[:20000])
+        else:
+            texts.append("[Binary attachment: " + name + "]")
+    return texts, images
 
 
 def model_order() -> list[str]:
@@ -200,46 +257,45 @@ async def clone_voice(
 
 
 @app.post("/chat/stream")
-def chat_stream(request: ChatRequest):
+async def chat_stream(
+    message: str = Form(..., min_length=1, max_length=12000),
+    lang: Literal["hi", "en"] = Form("hi"),
+    history: str = Form("[]"),
+    files: list[UploadFile] = File(default=[]),
+):
+    try:
+        request = ChatRequest(message=message, lang=lang, history=json.loads(history))
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="Invalid chat history: " + str(exc)[:120])
+    attachment_text, image_parts = await read_attachments(files)
     client = get_client()
-    messages = build_messages(request)
+    messages = build_messages(request, attachment_text, image_parts)
 
     def generate():
         global last_successful_model
-        failures = []
         for model in model_order():
             received_content = False
             try:
-                stream = client.chat.completions.create(
-                    model=model,
-                    messages=messages,
-                    max_tokens=1800,
-                    stream=True,
-                )
+                stream = client.chat.completions.create(model=model, messages=messages, max_tokens=1800, stream=True)
                 for chunk in stream:
                     if not chunk.choices:
                         continue
-                    text = chunk.choices[0].delta.content
-                    if text:
+                    piece = chunk.choices[0].delta.content
+                    if piece:
                         received_content = True
                         with model_lock:
                             last_successful_model = model
-                        yield text
+                        yield piece
                 if received_content:
                     return
-                failures.append(f"{model}: empty response")
-            except Exception as exc:
-                failures.append(f"{model}: {str(exc)[:140]}")
+            except Exception:
                 if received_content:
-                    yield "\n\n[Response interrupted by the AI provider. Please retry to get a complete answer.]"
+                    yield "\n\n[Response interrupted by the AI provider. Please retry.]"
                     return
         yield "CodeMitra could not get a response from the available AI models. Please try again later."
 
-    return StreamingResponse(
-        generate(),
-        media_type="text/plain; charset=utf-8",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-    )
+    return StreamingResponse(generate(), media_type="text/plain; charset=utf-8", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
 
 
 class ProjectFile(BaseModel):

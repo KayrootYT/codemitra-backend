@@ -8,6 +8,7 @@ services:
     env_file:
       - ../../.env
     environment:
+      PORT: "8000"
       TTS_PROVIDER: ${TTS_PROVIDER:-piper}
       PIPER_MODEL_DIR: /var/lib/codemitra/piper
     volumes:

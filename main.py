@@ -86,7 +86,7 @@ def build_messages(request: ChatRequest, attachment_text=None, image_parts=None)
             "You are CodeMitra, a helpful expert coding assistant. "
             f"Reply in {language}. Be accurate, practical, and clear. "
             "Explain assumptions, provide runnable code in fenced markdown blocks, "
-            "and never claim code was executed unless it actually was."
+            "and never claim code was executed unless it actually was. For complete project requests, emit every file in its own fenced code block with filename=relative/path.ext in the opening info string, for example python filename=src/main.py. Include all essential files and no placeholders."
         ),
     }]
     for item in request.history[-10:]:

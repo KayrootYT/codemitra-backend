@@ -53,6 +53,7 @@ class SpeechRequest(BaseModel):
     text: str = Field(min_length=1, max_length=4500)
     voice_id: str | None = Field(default=None, max_length=128)
     style: Literal["friendly", "calm", "energetic", "professional"] = "friendly"
+    gender: Literal["male", "female"] = "female"
     lang: Literal["hi", "en"] = "hi"
 
 
@@ -127,7 +128,7 @@ def voice_config():
 async def voice_speak(request: SpeechRequest):
     key = eleven_key()
     voice_id = request.voice_id or (
-        os.getenv("VOICE_FEMALE_ID") if request.lang == "hi" else os.getenv("VOICE_MALE_ID")
+        os.getenv("VOICE_MALE_ID") if request.gender == "male" else os.getenv("VOICE_FEMALE_ID")
     )
     if not voice_id:
         raise HTTPException(status_code=503, detail="Set VOICE_MALE_ID or VOICE_FEMALE_ID in backend environment.")

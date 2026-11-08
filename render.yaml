@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: codemitra-api
+    runtime: docker
+    plan: free
+    region: singapore
+    branch: feature/codemitra-quality-upgrade
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: ALLOWED_ORIGINS
+        value: https://kayrootyt.github.io
+      - key: TTS_PROVIDER
+        value: piper
+      - key: PIPER_MODEL_DIR
+        value: /tmp/codemitra-piper
+      - key: MODEL
+        value: deepseek-ai/deepseek-v4.1-flash
+      - key: NVIDIA_API_KEY
+        sync: false

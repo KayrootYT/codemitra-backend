@@ -1,5 +1,7 @@
 import os
 import json
+import asyncio
+import wave
 import base64
 import io
 import zipfile
@@ -44,6 +46,13 @@ last_successful_model = None
 model_lock = Lock()
 rate_lock = Lock()
 rate_events: dict[str, list[float]] = {}
+piper_lock = Lock()
+piper_cached_name: str | None = None
+piper_cached_voice = None
+PIPER_VOICES = {
+    "male": ("rohan", "hi_IN-rohan-medium"),
+    "female": ("priyamvada", "hi_IN-priyamvada-medium"),
+}
 
 
 def enforce_rate_limit(request: Request, bucket: str, limit: int, window_seconds: int) -> None:
@@ -184,8 +193,58 @@ def model_order() -> list[str]:
 def eleven_key() -> str:
     key = os.getenv("ELEVENLABS_API_KEY")
     if not key:
-        raise HTTPException(status_code=503, detail="Natural voice is not configured. Add ELEVENLABS_API_KEY on the backend.")
+        raise HTTPException(status_code=503, detail="ElevenLabs is not configured.")
     return key
+
+
+def synthesize_piper(text: str, gender: str) -> bytes:
+    """CPU-friendly offline Hindi TTS. Downloads each voice model on first use."""
+    global piper_cached_name, piper_cached_voice
+    speaker, model_name = PIPER_VOICES[gender]
+    model_dir = os.getenv("PIPER_MODEL_DIR", "/tmp/codemitra-piper")
+    os.makedirs(model_dir, exist_ok=True)
+    model_path = os.path.join(model_dir, model_name + ".onnx")
+    config_path = model_path + ".json"
+    base_url = (
+        "https://huggingface.co/rhasspy/piper-voices/resolve/main/"
+        f"hi/hi_IN/{speaker}/medium/{model_name}"
+    )
+
+    with piper_lock:
+        import httpx
+        from piper import PiperVoice
+
+        for path, url, max_bytes in (
+            (model_path, base_url + ".onnx", 80 * 1024 * 1024),
+            (config_path, base_url + ".onnx.json", 64 * 1024),
+        ):
+            if not os.path.isfile(path) or os.path.getsize(path) < 100:
+                temp_path = path + ".part"
+                try:
+                    with httpx.stream("GET", url, follow_redirects=True, timeout=180) as response:
+                        response.raise_for_status()
+                        total = 0
+                        with open(temp_path, "wb") as output:
+                            for chunk in response.iter_bytes():
+                                total += len(chunk)
+                                if total > max_bytes:
+                                    raise RuntimeError("Piper voice download exceeded its size limit.")
+                                output.write(chunk)
+                    if total < 100:
+                        raise RuntimeError("Piper voice download was empty.")
+                    os.replace(temp_path, path)
+                finally:
+                    if os.path.exists(temp_path):
+                        os.remove(temp_path)
+
+        if piper_cached_name != model_name or piper_cached_voice is None:
+            piper_cached_voice = PiperVoice.load(model_path, config_path=config_path, use_cuda=False)
+            piper_cached_name = model_name
+
+        buffer = io.BytesIO()
+        with wave.open(buffer, "wb") as wav_file:
+            piper_cached_voice.synthesize_wav(text, wav_file)
+        return buffer.getvalue()
 
 
 @app.get("/")

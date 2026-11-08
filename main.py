@@ -112,7 +112,7 @@ async def read_attachments(uploads: list[UploadFile]):
         total += len(data)
         if len(data) > 15 * 1024 * 1024 or total > 30 * 1024 * 1024:
             raise HTTPException(status_code=413, detail="Attachments exceed 30 MB total.")
-        name = (upload.filename or "attachment").replace("\\\\", "/").split("/")[-1][:160]
+        name = (upload.filename or "attachment").replace(chr(92), "/").split("/")[-1][:160]
         ctype = upload.content_type or "application/octet-stream"
         ext = PurePosixPath(name).suffix.lower()
         if ctype in {"image/jpeg", "image/png", "image/webp"}:
@@ -126,7 +126,7 @@ async def read_attachments(uploads: list[UploadFile]):
                     for info in archive.infolist()[:80]:
                         if info.is_dir() or info.file_size > 1000000:
                             continue
-                        path = info.filename.replace("\\\\", "/")
+                        path = info.filename.replace(chr(92), "/")
                         if ".." in PurePosixPath(path).parts:
                             continue
                         expanded += info.file_size
@@ -327,7 +327,7 @@ def create_project_zip(request: ProjectZipRequest):
             total_chars += len(item.content)
             if total_chars > 15000000:
                 raise HTTPException(status_code=413, detail="Project ZIP content exceeds 15 MB.")
-            normalized = item.path.replace("\\\\", "/").strip().lstrip("/")
+            normalized = item.path.replace(chr(92), "/").strip().lstrip("/")
             parts = PurePosixPath(normalized).parts
             if not normalized or any(part in {"..", "."} for part in parts) or ":" in normalized:
                 raise HTTPException(status_code=400, detail="Unsafe project file path.")

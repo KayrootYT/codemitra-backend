@@ -106,7 +106,7 @@ def chat_stream(request: ChatRequest):
         global last_successful_model
         failures = []
         for model in model_order():
-            collected = []
+            received_content = False
             try:
                 stream = client.chat.completions.create(
                     model=model,
@@ -119,20 +119,20 @@ def chat_stream(request: ChatRequest):
                         continue
                     text = chunk.choices[0].delta.content
                     if text:
-                        collected.append(text)
-                answer = "".join(collected)
-                if not answer.strip():
-                    failures.append(f"{model}: empty response")
-                    continue
-                with model_lock:
-                    last_successful_model = model
-                # Buffer each attempt so a failed provider cannot leak a partial
-                # answer before the next fallback model starts.
-                for start in range(0, len(answer), 96):
-                    yield answer[start:start + 96]
-                return
+                        received_content = True
+                        with model_lock:
+                            last_successful_model = model
+                        yield text
+                if received_content:
+                    return
+                failures.append(f"{model}: empty response")
             except Exception as exc:
                 failures.append(f"{model}: {str(exc)[:140]}")
+                # Once bytes have been sent, a different model cannot safely
+                # take over without mixing two answers in the same response.
+                if received_content:
+                    yield "\n\n[Response interrupted by the AI provider. Please retry to get a complete answer.]"
+                    return
         yield "CodeMitra could not get a response from the available AI models. Please try again later."
 
     return StreamingResponse(

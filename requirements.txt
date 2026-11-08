@@ -4,3 +4,4 @@ openai
 httpx
 python-multipart
 pypdf
+piper-tts==1.8.0

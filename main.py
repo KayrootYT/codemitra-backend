@@ -2,13 +2,14 @@ import os
 from threading import Lock
 from typing import Literal
 
-from fastapi import FastAPI, HTTPException
+import httpx
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, Response
 from openai import OpenAI
 from pydantic import BaseModel, Field
 
-app = FastAPI(title="CodeMitra API", version="2.0.0")
+app = FastAPI(title="CodeMitra API", version="2.1.0")
 
 allowed_origins = [
     origin.strip()
@@ -46,6 +47,13 @@ class ChatRequest(BaseModel):
     message: str = Field(min_length=1, max_length=12000)
     lang: Literal["hi", "en"] = "hi"
     history: list[HistoryMessage] = Field(default_factory=list, max_length=12)
+
+
+class SpeechRequest(BaseModel):
+    text: str = Field(min_length=1, max_length=4500)
+    voice_id: str | None = Field(default=None, max_length=128)
+    style: Literal["friendly", "calm", "energetic", "professional"] = "friendly"
+    lang: Literal["hi", "en"] = "hi"
 
 
 def get_client() -> OpenAI:
@@ -87,14 +95,107 @@ def model_order() -> list[str]:
     return preferred + [model for model in PREFERRED_MODELS if model not in preferred]
 
 
+def eleven_key() -> str:
+    key = os.getenv("ELEVENLABS_API_KEY")
+    if not key:
+        raise HTTPException(status_code=503, detail="Natural voice is not configured. Add ELEVENLABS_API_KEY on the backend.")
+    return key
+
+
 @app.get("/")
 def health():
-    return {"status": "ok", "service": "CodeMitra API", "version": "2.0.0"}
+    return {"status": "ok", "service": "CodeMitra API", "version": "2.1.0"}
 
 
 @app.get("/health")
 def health_check():
     return {"status": "healthy"}
+
+
+@app.get("/voice/config")
+def voice_config():
+    return {
+        "provider": "elevenlabs" if os.getenv("ELEVENLABS_API_KEY") else "browser",
+        "male_available": bool(os.getenv("VOICE_MALE_ID")),
+        "female_available": bool(os.getenv("VOICE_FEMALE_ID")),
+        "clone_available": bool(os.getenv("ELEVENLABS_API_KEY")),
+        "styles": ["friendly", "calm", "energetic", "professional"],
+    }
+
+
+@app.post("/voice/speak")
+async def voice_speak(request: SpeechRequest):
+    key = eleven_key()
+    voice_id = request.voice_id or (
+        os.getenv("VOICE_FEMALE_ID") if request.lang == "hi" else os.getenv("VOICE_MALE_ID")
+    )
+    if not voice_id:
+        raise HTTPException(status_code=503, detail="Set VOICE_MALE_ID or VOICE_FEMALE_ID in backend environment.")
+    style_prompts = {
+        "friendly": "Speak warmly and naturally, like a helpful friend.",
+        "calm": "Speak calmly, gently, and at a relaxed pace.",
+        "energetic": "Speak with positive energy and lively but natural emphasis.",
+        "professional": "Speak clearly and confidently in a polished professional tone.",
+    }
+    payload = {
+        "text": request.text,
+        "model_id": "eleven_v4_turbo",
+        "language_code": "hi" if request.lang == "hi" else "en",
+        "apply_text_normalization": "auto",
+        "voice_settings": {"stability": 0.48, "similarity_boost": 0.78, "style": 0.35, "use_speaker_boost": True},
+    }
+    # Delivery direction is prepended as a non-spoken model instruction.
+    payload["text"] = f"[{style_prompts[request.style]}] {request.text}"
+    async with httpx.AsyncClient(timeout=60) as client:
+        try:
+            result = await client.post(
+                f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}",
+                params={"output_format": "mp3_44100_128"},
+                headers={"xi-api-key": key, "Accept": "audio/mpeg", "Content-Type": "application/json"},
+                json=payload,
+            )
+        except httpx.HTTPError as exc:
+            raise HTTPException(status_code=502, detail=f"Voice provider connection failed: {str(exc)[:160]}")
+    if result.status_code >= 400:
+        raise HTTPException(status_code=502, detail=f"Voice generation failed ({result.status_code}): {result.text[:300]}")
+    return Response(content=result.content, media_type="audio/mpeg", headers={"Cache-Control": "no-store"})
+
+
+@app.post("/voice/clone")
+async def clone_voice(
+    name: str = Form(..., min_length=2, max_length=80),
+    consent: bool = Form(...),
+    audio: UploadFile = File(...),
+):
+    if not consent:
+        raise HTTPException(status_code=400, detail="Explicit voice-owner consent is required.")
+    key = eleven_key()
+    allowed_types = {"audio/mpeg", "audio/mp3", "audio/wav", "audio/x-wav", "audio/mp4", "audio/webm", "audio/ogg"}
+    if audio.content_type not in allowed_types:
+        raise HTTPException(status_code=415, detail="Upload an MP3, WAV, M4A, WebM, or OGG audio recording.")
+    data = await audio.read(20 * 1024 * 1024 + 1)
+    if len(data) < 10_000:
+        raise HTTPException(status_code=400, detail="Audio is too short. Use a clear recording of at least 10 seconds.")
+    if len(data) > 20 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="Audio file must be 20 MB or smaller.")
+    files = {"files": (audio.filename or "voice-sample.mp3", data, audio.content_type)}
+    form = {"name": name, "description": "CodeMitra user-created voice profile"}
+    async with httpx.AsyncClient(timeout=120) as client:
+        try:
+            result = await client.post(
+                "https://api.elevenlabs.io/v1/voices/add",
+                headers={"xi-api-key": key},
+                data=form,
+                files=files,
+            )
+        except httpx.HTTPError as exc:
+            raise HTTPException(status_code=502, detail=f"Voice cloning service connection failed: {str(exc)[:160]}")
+    if result.status_code >= 400:
+        raise HTTPException(status_code=502, detail=f"Voice cloning failed ({result.status_code}): {result.text[:300]}")
+    body = result.json()
+    if not body.get("voice_id"):
+        raise HTTPException(status_code=502, detail="Voice provider did not return a voice ID.")
+    return {"voice_id": body["voice_id"], "name": name, "message": "Voice profile created. Keep consent and original recording."}
 
 
 @app.post("/chat/stream")
@@ -128,8 +229,6 @@ def chat_stream(request: ChatRequest):
                 failures.append(f"{model}: empty response")
             except Exception as exc:
                 failures.append(f"{model}: {str(exc)[:140]}")
-                # Once bytes have been sent, a different model cannot safely
-                # take over without mixing two answers in the same response.
                 if received_content:
                     yield "\n\n[Response interrupted by the AI provider. Please retry to get a complete answer.]"
                     return

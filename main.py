@@ -5,16 +5,17 @@ import io
 import zipfile
 from pathlib import PurePosixPath
 from threading import Lock
+from time import monotonic
 from typing import Literal
 
 import httpx
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, Response
 from openai import OpenAI
 from pydantic import BaseModel, Field
 
-app = FastAPI(title="CodeMitra API", version="2.2.0")
+app = FastAPI(title="CodeMitra API", version="2.3.0")
 
 allowed_origins = [
     origin.strip()
@@ -41,6 +42,21 @@ PREFERRED_MODELS = [
 ]
 last_successful_model = None
 model_lock = Lock()
+rate_lock = Lock()
+rate_events: dict[str, list[float]] = {}
+
+
+def enforce_rate_limit(request: Request, bucket: str, limit: int, window_seconds: int) -> None:
+    """Small per-client in-memory guard for expensive voice provider calls."""
+    client_ip = request.client.host if request.client else "unknown"
+    key = f"{bucket}:{client_ip}"
+    now = monotonic()
+    with rate_lock:
+        recent = [stamp for stamp in rate_events.get(key, []) if now - stamp < window_seconds]
+        if len(recent) >= limit:
+            raise HTTPException(status_code=429, detail="Too many requests. Please wait and try again.")
+        recent.append(now)
+        rate_events[key] = recent
 
 
 class HistoryMessage(BaseModel):
@@ -174,7 +190,7 @@ def eleven_key() -> str:
 
 @app.get("/")
 def health():
-    return {"status": "ok", "service": "CodeMitra API", "version": "2.1.0"}
+    return {"status": "ok", "service": "CodeMitra API", "version": "2.3.0"}
 
 
 @app.get("/health")
@@ -194,7 +210,8 @@ def voice_config():
 
 
 @app.post("/voice/speak")
-async def voice_speak(request: SpeechRequest):
+async def voice_speak(request: SpeechRequest, http_request: Request):
+    enforce_rate_limit(http_request, "voice_speak", 30, 60)
     key = eleven_key()
     voice_id = request.voice_id or (
         os.getenv("VOICE_MALE_ID") if request.gender == "male" else os.getenv("VOICE_FEMALE_ID")
@@ -230,10 +247,12 @@ async def voice_speak(request: SpeechRequest):
 
 @app.post("/voice/clone")
 async def clone_voice(
+    http_request: Request,
     name: str = Form(..., min_length=2, max_length=80),
     consent: bool = Form(...),
     audio: UploadFile = File(...),
 ):
+    enforce_rate_limit(http_request, "voice_clone", 3, 3600)
     if not consent:
         raise HTTPException(status_code=400, detail="Explicit voice-owner consent is required.")
     key = eleven_key()

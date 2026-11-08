@@ -14,7 +14,7 @@ from fastapi.responses import StreamingResponse, Response
 from openai import OpenAI
 from pydantic import BaseModel, Field
 
-app = FastAPI(title="CodeMitra API", version="2.1.0")
+app = FastAPI(title="CodeMitra API", version="2.2.0")
 
 allowed_origins = [
     origin.strip()
@@ -321,8 +321,12 @@ class ProjectZipRequest(BaseModel):
 def create_project_zip(request: ProjectZipRequest):
     buffer = io.BytesIO()
     seen = set()
+    total_chars = 0
     with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         for item in request.files:
+            total_chars += len(item.content)
+            if total_chars > 15000000:
+                raise HTTPException(status_code=413, detail="Project ZIP content exceeds 15 MB.")
             normalized = item.path.replace("\\\\", "/").strip().lstrip("/")
             parts = PurePosixPath(normalized).parts
             if not normalized or any(part in {"..", "."} for part in parts) or ":" in normalized:

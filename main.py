@@ -260,7 +260,8 @@ def health_check():
 @app.get("/voice/config")
 def voice_config():
     has_elevenlabs = bool(os.getenv("ELEVENLABS_API_KEY"))
-    piper_enabled = os.getenv("TTS_PROVIDER", "piper").lower() in {"piper", "auto"}
+    provider = os.getenv("TTS_PROVIDER", "auto").lower()
+    piper_enabled = provider == "piper" or (provider == "auto" and not has_elevenlabs)
     return {
         "provider": "elevenlabs" if has_elevenlabs else "piper" if piper_enabled else "browser",
         "male_available": (has_elevenlabs and bool(os.getenv("VOICE_MALE_ID"))) or piper_enabled,
@@ -274,15 +275,16 @@ def voice_config():
 async def voice_speak(request: SpeechRequest, http_request: Request):
     enforce_rate_limit(http_request, "voice_speak", 30, 60)
     key = os.getenv("ELEVENLABS_API_KEY")
-    provider = os.getenv("TTS_PROVIDER", "piper").lower()
-    if not key and request.lang == "hi" and provider in {"piper", "auto"}:
+    provider = os.getenv("TTS_PROVIDER", "auto").lower()
+    use_piper = request.lang == "hi" and (provider == "piper" or (provider == "auto" and not key))
+    if use_piper:
         try:
             audio = await asyncio.to_thread(synthesize_piper, request.text, request.gender)
         except Exception as exc:
             raise HTTPException(status_code=502, detail=f"Open-source Hindi TTS failed: {str(exc)[:220]}")
         return Response(content=audio, media_type="audio/wav", headers={"Cache-Control": "no-store"})
     if not key:
-        raise HTTPException(status_code=503, detail="Set ELEVENLABS_API_KEY or enable TTS_PROVIDER=piper for Hindi voice.")
+        raise HTTPException(status_code=503, detail="Set TTS_PROVIDER=piper for open-source Hindi TTS, or configure ElevenLabs.")
     voice_id = request.voice_id or (
         os.getenv("VOICE_MALE_ID") if request.gender == "male" else os.getenv("VOICE_FEMALE_ID")
     )

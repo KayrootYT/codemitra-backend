@@ -1,4 +1,9 @@
 import os
+import json
+import base64
+import io
+import zipfile
+from pathlib import PurePosixPath
 from threading import Lock
 from typing import Literal
 
@@ -9,7 +14,7 @@ from fastapi.responses import StreamingResponse, Response
 from openai import OpenAI
 from pydantic import BaseModel, Field
 
-app = FastAPI(title="CodeMitra API", version="2.1.0")
+app = FastAPI(title="CodeMitra API", version="2.2.0")
 
 allowed_origins = [
     origin.strip()
@@ -69,7 +74,7 @@ def get_client() -> OpenAI:
     )
 
 
-def build_messages(request: ChatRequest) -> list[dict]:
+def build_messages(request: ChatRequest, attachment_text=None, image_parts=None) -> list[dict]:
     language = (
         "Hindi (use Roman or Devanagari script to match the user)"
         if request.lang == "hi"
@@ -81,13 +86,77 @@ def build_messages(request: ChatRequest) -> list[dict]:
             "You are CodeMitra, a helpful expert coding assistant. "
             f"Reply in {language}. Be accurate, practical, and clear. "
             "Explain assumptions, provide runnable code in fenced markdown blocks, "
-            "and never claim code was executed unless it actually was."
+            "and never claim code was executed unless it actually was. For complete project requests, emit every file in its own fenced code block with filename=relative/path.ext in the opening info string, for example python filename=src/main.py. Include all essential files and no placeholders."
         ),
     }]
     for item in request.history[-10:]:
         messages.append({"role": item.role, "content": item.content})
-    messages.append({"role": "user", "content": request.message})
+    user_text = request.message
+    if attachment_text:
+        user_text += "\n\nATTACHED FILE CONTENTS:\n" + "\n\n".join(attachment_text)
+    if image_parts:
+        messages.append({"role": "user", "content": [{"type": "text", "text": user_text}] + image_parts})
+    else:
+        messages.append({"role": "user", "content": user_text})
     return messages
+
+
+
+
+TEXT_EXTENSIONS = {".txt", ".md", ".py", ".js", ".jsx", ".ts", ".tsx", ".html", ".css", ".json", ".xml", ".yaml", ".yml", ".toml", ".ini", ".kt", ".java", ".gradle", ".properties", ".sql", ".sh", ".csv", ".log", ".dart", ".swift", ".c", ".cpp", ".h", ".go", ".rs", ".php", ".rb", ".vue", ".svelte"}
+
+async def read_attachments(uploads: list[UploadFile]):
+    texts, images, total = [], [], 0
+    for upload in uploads[:10]:
+        data = await upload.read(15 * 1024 * 1024 + 1)
+        total += len(data)
+        if len(data) > 15 * 1024 * 1024 or total > 30 * 1024 * 1024:
+            raise HTTPException(status_code=413, detail="Attachments exceed 30 MB total.")
+        name = (upload.filename or "attachment").replace(chr(92), "/").split("/")[-1][:160]
+        ctype = upload.content_type or "application/octet-stream"
+        ext = PurePosixPath(name).suffix.lower()
+        if ctype in {"image/jpeg", "image/png", "image/webp"}:
+            encoded = base64.b64encode(data).decode("ascii")
+            images.append({"type": "image_url", "image_url": {"url": "data:" + ctype + ";base64," + encoded}})
+            texts.append("[Image attached: " + name + "]")
+        elif ext == ".zip" or ctype in {"application/zip", "application/x-zip-compressed"}:
+            try:
+                with zipfile.ZipFile(io.BytesIO(data)) as archive:
+                    expanded = 0
+                    for info in archive.infolist()[:80]:
+                        if info.is_dir() or info.file_size > 1000000:
+                            continue
+                        path = info.filename.replace(chr(92), "/")
+                        if ".." in PurePosixPath(path).parts:
+                            continue
+                        expanded += info.file_size
+                        if expanded > 8000000:
+                            break
+                        if PurePosixPath(path).suffix.lower() in TEXT_EXTENSIONS:
+                            texts.append("--- ZIP FILE: " + path + " ---\n" + archive.read(info).decode("utf-8", errors="replace")[:12000])
+            except zipfile.BadZipFile:
+                raise HTTPException(status_code=400, detail="Invalid ZIP archive.")
+        elif ext == ".pdf" or ctype == "application/pdf":
+            try:
+                from pypdf import PdfReader
+                reader = PdfReader(io.BytesIO(data))
+                texts.append("--- PDF: " + name + " ---\n" + "\n".join((p.extract_text() or "") for p in reader.pages[:30])[:30000])
+            except Exception:
+                texts.append("[PDF text extraction unavailable for " + name + "]")
+        elif ext == ".docx":
+            try:
+                from xml.etree import ElementTree
+                with zipfile.ZipFile(io.BytesIO(data)) as archive:
+                    root = ElementTree.fromstring(archive.read("word/document.xml"))
+                content = " ".join(node.text or "" for node in root.iter() if node.tag.endswith("}t"))
+                texts.append("--- DOCX: " + name + " ---\n" + content[:30000])
+            except Exception:
+                texts.append("[DOCX text extraction unavailable for " + name + "]")
+        elif ext in TEXT_EXTENSIONS or ctype.startswith("text/"):
+            texts.append("--- FILE: " + name + " ---\n" + data.decode("utf-8", errors="replace")[:20000])
+        else:
+            texts.append("[Binary attachment: " + name + "]")
+    return texts, images
 
 
 def model_order() -> list[str]:
@@ -197,43 +266,75 @@ async def clone_voice(
 
 
 @app.post("/chat/stream")
-def chat_stream(request: ChatRequest):
+async def chat_stream(
+    message: str = Form(..., min_length=1, max_length=12000),
+    lang: Literal["hi", "en"] = Form("hi"),
+    history: str = Form("[]"),
+    files: list[UploadFile] = File(default=[]),
+):
+    try:
+        request = ChatRequest(message=message, lang=lang, history=json.loads(history))
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="Invalid chat history: " + str(exc)[:120])
+    attachment_text, image_parts = await read_attachments(files)
     client = get_client()
-    messages = build_messages(request)
+    messages = build_messages(request, attachment_text, image_parts)
 
     def generate():
         global last_successful_model
-        failures = []
         for model in model_order():
             received_content = False
             try:
-                stream = client.chat.completions.create(
-                    model=model,
-                    messages=messages,
-                    max_tokens=1800,
-                    stream=True,
-                )
+                stream = client.chat.completions.create(model=model, messages=messages, max_tokens=1800, stream=True)
                 for chunk in stream:
                     if not chunk.choices:
                         continue
-                    text = chunk.choices[0].delta.content
-                    if text:
+                    piece = chunk.choices[0].delta.content
+                    if piece:
                         received_content = True
                         with model_lock:
                             last_successful_model = model
-                        yield text
+                        yield piece
                 if received_content:
                     return
-                failures.append(f"{model}: empty response")
-            except Exception as exc:
-                failures.append(f"{model}: {str(exc)[:140]}")
+            except Exception:
                 if received_content:
-                    yield "\n\n[Response interrupted by the AI provider. Please retry to get a complete answer.]"
+                    yield "\n\n[Response interrupted by the AI provider. Please retry.]"
                     return
         yield "CodeMitra could not get a response from the available AI models. Please try again later."
 
-    return StreamingResponse(
-        generate(),
-        media_type="text/plain; charset=utf-8",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-    )
+    return StreamingResponse(generate(), media_type="text/plain; charset=utf-8", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+
+class ProjectFile(BaseModel):
+    path: str = Field(min_length=1, max_length=240)
+    content: str = Field(max_length=2000000)
+
+
+class ProjectZipRequest(BaseModel):
+    project_name: str = Field(default="CodeMitra-Project", min_length=1, max_length=80)
+    files: list[ProjectFile] = Field(min_length=1, max_length=100)
+
+
+@app.post("/project/zip")
+def create_project_zip(request: ProjectZipRequest):
+    buffer = io.BytesIO()
+    seen = set()
+    total_chars = 0
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for item in request.files:
+            total_chars += len(item.content)
+            if total_chars > 15000000:
+                raise HTTPException(status_code=413, detail="Project ZIP content exceeds 15 MB.")
+            normalized = item.path.replace(chr(92), "/").strip().lstrip("/")
+            parts = PurePosixPath(normalized).parts
+            if not normalized or any(part in {"..", "."} for part in parts) or ":" in normalized:
+                raise HTTPException(status_code=400, detail="Unsafe project file path.")
+            path = "/".join(parts)
+            if path in seen:
+                raise HTTPException(status_code=400, detail="Duplicate project file path.")
+            seen.add(path)
+            archive.writestr(path, item.content)
+    name = "".join(c for c in request.project_name if c.isalnum() or c in "-_ ")[:60].strip() or "CodeMitra-Project"
+    return Response(content=buffer.getvalue(), media_type="application/zip", headers={"Content-Disposition": "attachment; filename=\"" + name + ".zip\"", "Cache-Control": "no-store"})

@@ -13,4 +13,4 @@ jobs:
           python-version: '3.11'
       - run: pip install -r requirements.txt
       - run: python -m py_compile main.py
-      - run: python -c "import main; assert any(r.path == '/chat/stream' for r in main.app.routes); assert any(r.path == '/project/zip' for r in main.app.routes); assert any(r.path == '/voice/speak' for r in main.app.routes); assert any(r.path == '/voice/clone' for r in main.app.routes); assert main.app.version == '2.3.0'; print('CodeMitra API routes and version loaded')"
+      - run: python -c "import main; assert any(r.path == '/chat/stream' for r in main.app.routes); assert any(r.path == '/project/zip' for r in main.app.routes); assert any(r.path == '/voice/speak' for r in main.app.routes); assert any(r.path == '/voice/config' for r in main.app.routes); assert set(main.PIPER_VOICES) == {'male', 'female'}; assert any(r.path == '/voice/clone' for r in main.app.routes); assert main.app.version == '2.3.0'; print('CodeMitra API routes and version loaded')"

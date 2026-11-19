@@ -1,0 +1,9 @@
+{$API_DOMAIN} {
+    encode zstd gzip
+
+    request_body {
+        max_size 40MB
+    }
+
+    reverse_proxy api:8000
+}

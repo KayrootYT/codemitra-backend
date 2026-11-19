@@ -1,0 +1,51 @@
+services:
+  api:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    container_name: codemitra-api
+    restart: unless-stopped
+    env_file:
+      - ../../.env
+    environment:
+      PORT: "8000"
+      TTS_PROVIDER: ${TTS_PROVIDER:-piper}
+      PIPER_MODEL_DIR: /var/lib/codemitra/piper
+    volumes:
+      - piper-models:/var/lib/codemitra/piper
+    expose:
+      - "8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=5)"]
+      interval: 30s
+      timeout: 8s
+      retries: 3
+      start_period: 60s
+    security_opt:
+      - no-new-privileges:true
+    init: true
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: codemitra-caddy
+    restart: unless-stopped
+    environment:
+      API_DOMAIN: ${API_DOMAIN:?Set API_DOMAIN in the root .env file}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      api:
+        condition: service_healthy
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  piper-models:
+  caddy-data:
+  caddy-config:

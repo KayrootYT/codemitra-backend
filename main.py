@@ -1,20 +1,23 @@
 import os
 import json
+import asyncio
+import wave
 import base64
 import io
 import zipfile
 from pathlib import PurePosixPath
 from threading import Lock
+from time import monotonic
 from typing import Literal
 
 import httpx
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, Response
 from openai import OpenAI
 from pydantic import BaseModel, Field
 
-app = FastAPI(title="CodeMitra API", version="2.2.0")
+app = FastAPI(title="CodeMitra API", version="2.3.0")
 
 allowed_origins = [
     origin.strip()
@@ -41,6 +44,28 @@ PREFERRED_MODELS = [
 ]
 last_successful_model = None
 model_lock = Lock()
+rate_lock = Lock()
+rate_events: dict[str, list[float]] = {}
+piper_lock = Lock()
+piper_cached_name: str | None = None
+piper_cached_voice = None
+PIPER_VOICES = {
+    "male": ("rohan", "hi_IN-rohan-medium"),
+    "female": ("priyamvada", "hi_IN-priyamvada-medium"),
+}
+
+
+def enforce_rate_limit(request: Request, bucket: str, limit: int, window_seconds: int) -> None:
+    """Small per-client in-memory guard for expensive voice provider calls."""
+    client_ip = request.client.host if request.client else "unknown"
+    key = f"{bucket}:{client_ip}"
+    now = monotonic()
+    with rate_lock:
+        recent = [stamp for stamp in rate_events.get(key, []) if now - stamp < window_seconds]
+        if len(recent) >= limit:
+            raise HTTPException(status_code=429, detail="Too many requests. Please wait and try again.")
+        recent.append(now)
+        rate_events[key] = recent
 
 
 class HistoryMessage(BaseModel):
@@ -168,13 +193,63 @@ def model_order() -> list[str]:
 def eleven_key() -> str:
     key = os.getenv("ELEVENLABS_API_KEY")
     if not key:
-        raise HTTPException(status_code=503, detail="Natural voice is not configured. Add ELEVENLABS_API_KEY on the backend.")
+        raise HTTPException(status_code=503, detail="ElevenLabs is not configured.")
     return key
+
+
+def synthesize_piper(text: str, gender: str) -> bytes:
+    """CPU-friendly offline Hindi TTS. Downloads each voice model on first use."""
+    global piper_cached_name, piper_cached_voice
+    speaker, model_name = PIPER_VOICES[gender]
+    model_dir = os.getenv("PIPER_MODEL_DIR", "/tmp/codemitra-piper")
+    os.makedirs(model_dir, exist_ok=True)
+    model_path = os.path.join(model_dir, model_name + ".onnx")
+    config_path = model_path + ".json"
+    base_url = (
+        "https://huggingface.co/rhasspy/piper-voices/resolve/main/"
+        f"hi/hi_IN/{speaker}/medium/{model_name}"
+    )
+
+    with piper_lock:
+        import httpx
+        from piper import PiperVoice
+
+        for path, url, max_bytes in (
+            (model_path, base_url + ".onnx", 80 * 1024 * 1024),
+            (config_path, base_url + ".onnx.json", 64 * 1024),
+        ):
+            if not os.path.isfile(path) or os.path.getsize(path) < 100:
+                temp_path = path + ".part"
+                try:
+                    with httpx.stream("GET", url, follow_redirects=True, timeout=180) as response:
+                        response.raise_for_status()
+                        total = 0
+                        with open(temp_path, "wb") as output:
+                            for chunk in response.iter_bytes():
+                                total += len(chunk)
+                                if total > max_bytes:
+                                    raise RuntimeError("Piper voice download exceeded its size limit.")
+                                output.write(chunk)
+                    if total < 100:
+                        raise RuntimeError("Piper voice download was empty.")
+                    os.replace(temp_path, path)
+                finally:
+                    if os.path.exists(temp_path):
+                        os.remove(temp_path)
+
+        if piper_cached_name != model_name or piper_cached_voice is None:
+            piper_cached_voice = PiperVoice.load(model_path, config_path=config_path, use_cuda=False)
+            piper_cached_name = model_name
+
+        buffer = io.BytesIO()
+        with wave.open(buffer, "wb") as wav_file:
+            piper_cached_voice.synthesize_wav(text, wav_file)
+        return buffer.getvalue()
 
 
 @app.get("/")
 def health():
-    return {"status": "ok", "service": "CodeMitra API", "version": "2.1.0"}
+    return {"status": "ok", "service": "CodeMitra API", "version": "2.3.0"}
 
 
 @app.get("/health")
@@ -184,18 +259,32 @@ def health_check():
 
 @app.get("/voice/config")
 def voice_config():
+    has_elevenlabs = bool(os.getenv("ELEVENLABS_API_KEY"))
+    provider = os.getenv("TTS_PROVIDER", "auto").lower()
+    piper_enabled = provider == "piper" or (provider == "auto" and not has_elevenlabs)
     return {
-        "provider": "elevenlabs" if os.getenv("ELEVENLABS_API_KEY") else "browser",
-        "male_available": bool(os.getenv("VOICE_MALE_ID")),
-        "female_available": bool(os.getenv("VOICE_FEMALE_ID")),
-        "clone_available": bool(os.getenv("ELEVENLABS_API_KEY")),
+        "provider": "elevenlabs" if has_elevenlabs else "piper" if piper_enabled else "browser",
+        "male_available": (has_elevenlabs and bool(os.getenv("VOICE_MALE_ID"))) or piper_enabled,
+        "female_available": (has_elevenlabs and bool(os.getenv("VOICE_FEMALE_ID"))) or piper_enabled,
+        "clone_available": has_elevenlabs,
         "styles": ["friendly", "calm", "energetic", "professional"],
     }
 
 
 @app.post("/voice/speak")
-async def voice_speak(request: SpeechRequest):
-    key = eleven_key()
+async def voice_speak(request: SpeechRequest, http_request: Request):
+    enforce_rate_limit(http_request, "voice_speak", 30, 60)
+    key = os.getenv("ELEVENLABS_API_KEY")
+    provider = os.getenv("TTS_PROVIDER", "auto").lower()
+    use_piper = request.lang == "hi" and (provider == "piper" or (provider == "auto" and not key))
+    if use_piper:
+        try:
+            audio = await asyncio.to_thread(synthesize_piper, request.text, request.gender)
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"Open-source Hindi TTS failed: {str(exc)[:220]}")
+        return Response(content=audio, media_type="audio/wav", headers={"Cache-Control": "no-store"})
+    if not key:
+        raise HTTPException(status_code=503, detail="Set TTS_PROVIDER=piper for open-source Hindi TTS, or configure ElevenLabs.")
     voice_id = request.voice_id or (
         os.getenv("VOICE_MALE_ID") if request.gender == "male" else os.getenv("VOICE_FEMALE_ID")
     )
@@ -230,10 +319,12 @@ async def voice_speak(request: SpeechRequest):
 
 @app.post("/voice/clone")
 async def clone_voice(
+    http_request: Request,
     name: str = Form(..., min_length=2, max_length=80),
     consent: bool = Form(...),
     audio: UploadFile = File(...),
 ):
+    enforce_rate_limit(http_request, "voice_clone", 3, 3600)
     if not consent:
         raise HTTPException(status_code=400, detail="Explicit voice-owner consent is required.")
     key = eleven_key()
